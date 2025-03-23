@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Template B: Deploys ManageAlarmsLambda that creates or updates 
+  Kinesis latency-based alarms if the stream is PROVISIONED mode.
+  Includes:
+    - Daily schedule enumerating all streams
+    - CloudTrail rule for CreateStream
+    - Skips alarm creation if the same AlarmName already exists
+    - Alarm thresholds changed to 200/400/600/800
+
+Parameters:
+  AutoScalingSNSTopicArn:
+    Type: String
+    Description: "SNS topic ARN (from Template A) to which CloudWatch alarms will send notifications"
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: "Timeout (seconds) for ManageAlarmsLambda"
+
+  LambdaMemory:
+    Type: Number
+    Default: 128
+    Description: "Memory size (MB) for ManageAlarmsLambda"
+
+Resources:
+  ########################################
+  # 1) IAM Role for ManageAlarmsLambda
+  ########################################
+  ManageAlarmsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ManageAlarmsLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                  - kinesis:ListStreams
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:DescribeStream
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName: "ssm.alarms.cloudwatch.amazonaws.com"
+
+  ########################################
+  # 2) ManageAlarmsLambda
+  ########################################
+  ManageAlarmsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt ManageAlarmsLambdaRole.Arn
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemory
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AutoScalingSNSTopicArn
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import logging
+          import boto3
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          cloudwatch = boto3.client('cloudwatch')
+          kinesis = boto3.client('kinesis')
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+
+          def lambda_handler(event, context):
+              """
+              Handler invoked by:
+                1) Daily schedule -> check all streams
+                2) CloudTrail event -> single newly created stream
+              Only create alarms if the stream is in PROVISIONED mode.
+              If an alarm with the same name already exists, skip updating it.
+              """
+              logger.info(f"Event: {json.dumps(event)}")
+
+              # If a new stream was just created, parse from CloudTrail
+              new_stream_name = parse_create_stream(event)
+              if new_stream_name:
+                  logger.info(f"New Kinesis stream created: {new_stream_name}")
+                  ensure_alarms_for_stream(new_stream_name)
+              else:
+                  logger.info("No new stream indicated; checking all existing streams.")
+                  paginator = kinesis.get_paginator('list_streams')
+                  for page in paginator.paginate():
+                      for stream_name in page.get('StreamNames', []):
+                          ensure_alarms_for_stream(stream_name)
+
+              return {"status": "OK"}
+
+          def parse_create_stream(event):
+              """
+              Check if the event is a CloudTrail 'CreateStream' call.
+              If so, return the newly created stream name; else None.
+              """
+              detail = event.get('detail', {})
+              if detail.get('eventName') == 'CreateStream':
+                  params = detail.get('requestParameters', {})
+                  return params.get('streamName')
+              return None
+
+          def ensure_alarms_for_stream(stream_name):
+              """
+              First check if the stream is PROVISIONED mode. 
+              If so, create/update 5 metric-math alarms to publish to SNS_TOPIC_ARN,
+              skipping if the same alarm name is already present.
+              """
+              mode = get_stream_mode(stream_name)
+              if mode != 'PROVISIONED':
+                  logger.info(f"Stream '{stream_name}' is {mode} (not PROVISIONED). Skipping alarms.")
+                  return
+
+              logger.info(f"Ensuring 5 alarms for PROVISIONED stream: {stream_name}")
+              
+              # 1) Latency < 200
+              put_latency_alarm(
+                  stream_name=stream_name,
+                  alarm_suffix="LatencyRange1-Under200",
+                  expr="IF(m1 < 200, 1, 0)",
+                  description="Latency < 200 => scale to 1 shard"
+              )
+              # 2) 200 <= Latency < 400
+              put_latency_alarm(
+                  stream_name=stream_name,
+                  alarm_suffix="LatencyRange2-200-400",
+                  expr="IF((m1 >= 200) AND (m1 < 400), 1, 0)",
+                  description="200 <= Latency < 400 => scale to 2 shards"
+              )
+              # 3) 400 <= Latency < 600
+              put_latency_alarm(
+                  stream_name=stream_name,
+                  alarm_suffix="LatencyRange4-400-600",
+                  expr="IF((m1 >= 400) AND (m1 < 600), 1, 0)",
+                  description="400 <= Latency < 600 => scale to 4 shards"
+              )
+              # 4) 600 <= Latency < 800
+              put_latency_alarm(
+                  stream_name=stream_name,
+                  alarm_suffix="LatencyRange6-600-800",
+                  expr="IF((m1 >= 600) AND (m1 < 800), 1, 0)",
+                  description="600 <= Latency < 800 => scale to 6 shards"
+              )
+              # 5) Latency >= 800
+              put_latency_alarm(
+                  stream_name=stream_name,
+                  alarm_suffix="LatencyRange8-800Plus",
+                  expr="IF(m1 >= 800, 1, 0)",
+                  description="Latency >= 800 => scale to 8 shards"
+              )
+
+          def get_stream_mode(stream_name):
+              """
+              Return 'PROVISIONED' or 'ON_DEMAND' if the stream has StreamModeDetails,
+              else fallback to 'UNKNOWN'.
+              """
+              try:
+                  summary = kinesis.describe_stream_summary(StreamName=stream_name)
+                  mode_details = summary['StreamDescriptionSummary'].get('StreamModeDetails', {})
+                  return mode_details.get('StreamMode', 'UNKNOWN')
+              except ClientError as e:
+                  logger.error(f"Error describing {stream_name}: {e}")
+                  return 'UNKNOWN'
+
+          def put_latency_alarm(stream_name, alarm_suffix, expr, description):
+              """
+              Create or update a metric-math alarm for GetRecords.Latency.
+              If an alarm with the same AlarmName exists, skip it.
+              Requires 3 consecutive data points >= 1 to trigger.
+              Publishes to the SNS topic that triggers the scaling Lambda.
+              """
+              alarm_name = f"{stream_name}-{alarm_suffix}"
+              logger.info(f"Checking alarm '{alarm_name}' existence before creating/updating...")
+
+              if alarm_exists(alarm_name):
+                  logger.info(f"Alarm '{alarm_name}' already exists. Skipping update.")
+                  return
+
+              # Alarm does not exist - create it
+              logger.info(f"Alarm '{alarm_name}' not found. Proceeding with PutMetricAlarm.")
+              try:
+                  cloudwatch.put_metric_alarm(
+                      AlarmName=alarm_name,
+                      AlarmDescription=description,
+                      ComparisonOperator='GreaterThanOrEqualToThreshold',
+                      Threshold=1,
+                      EvaluationPeriods=3,
+                      DatapointsToAlarm=3,
+                      TreatMissingData='missing',
+                      Metrics=[
+                          {
+                              'Id': 'm1',
+                              'MetricStat': {
+                                  'Metric': {
+                                      'Namespace': 'AWS/Kinesis',
+                                      'MetricName': 'GetRecords.Latency',
+                                      'Dimensions': [
+                                          {
+                                              'Name': 'StreamName',
+                                              'Value': stream_name
+                                          }
+                                      ]
+                                  },
+                                  'Period': 300,
+                                  'Stat': 'Average'
+                              },
+                              'ReturnData': False
+                          },
+                          {
+                              'Id': 'range_expr',
+                              'Expression': expr,
+                              'Label': 'range-check',
+                              'ReturnData': True
+                          }
+                      ],
+                      AlarmActions=[SNS_TOPIC_ARN]
+                  )
+                  logger.info(f"Successfully created alarm '{alarm_name}'")
+              except Exception as e:
+                  logger.error(f"Error creating alarm {alarm_name}: {e}", exc_info=True)
+
+          def alarm_exists(alarm_name):
+              """
+              Returns True if an alarm with the given name already exists in CloudWatch,
+              else False.
+              """
+              try:
+                  resp = cloudwatch.describe_alarms(AlarmNames=[alarm_name])
+                  # If found in either MetricAlarms or CompositeAlarms, we consider it existing
+                  if resp.get('MetricAlarms') or resp.get('CompositeAlarms'):
+                      return True
+                  return False
+              except ClientError as e:
+                  logger.error(f"Error describing alarm {alarm_name}: {e}", exc_info=True)
+                  return False
+
+  ########################################
+  # 3) EventBridge Rule: Scheduled Daily
+  ########################################
+  DailyAlarmCheckRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: "rate(1 day)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ManageAlarmsLambda.Arn
+          Id: "ManageAlarmsLambdaDaily"
+
+  DailyAlarmCheckPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ManageAlarmsLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyAlarmCheckRule.Arn
+
+  ########################################
+  # 4) EventBridge Rule: CloudTrail CreateStream
+  #
+  # We match:
+  #   detail-type = "AWS API Call via CloudTrail"
+  #   detail.eventSource = "kinesis.amazonaws.com"
+  #   detail.eventName = "CreateStream"
+  #
+  # This triggers ManageAlarmsLambda for newly created Kinesis streams.
+  ########################################
+  OnKinesisCreateStreamRule:
+    Type: AWS::Events::Rule
+    Properties:
+      State: ENABLED
+      EventPattern:
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - "kinesis.amazonaws.com"
+          eventName:
+            - "CreateStream"
+      Targets:
+        - Arn: !GetAtt ManageAlarmsLambda.Arn
+          Id: "ManageAlarmsLambdaNewStream"
+
+  OnKinesisCreateStreamPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ManageAlarmsLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OnKinesisCreateStreamRule.Arn
+
+Outputs:
+  ManageAlarmsLambdaName:
+    Description: "Lambda that creates/updates Kinesis latency-based alarms if PROVISIONED"
+    Value: !GetAtt ManageAlarmsLambda.Arn

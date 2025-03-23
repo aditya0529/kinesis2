@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Template A: Deploys SNS topic & KinesisScalingLambda.
+  The scaling Lambda is subscribed to the SNS topic (so it receives
+  CloudWatch alarm notifications) and scales shard counts accordingly.
+  This version uses the stream ARN in API calls and a more restrictive
+  IAM policy for least privilege.
+
+Parameters:
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: Lambda function timeout in seconds
+
+  LambdaMemory:
+    Type: Number
+    Default: 256
+    Description: Lambda function memory size in MB
+
+Resources:
+  ########################################
+  # 1) SNS Topic for Alarms
+  ########################################
+  AutoScalingSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "KinesisAutoScalingTopic"
+
+  ########################################
+  # 2) IAM Role for KinesisScalingLambda
+  ########################################
+  KinesisScalingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      # Use the AWSLambdaBasicExecutionRole managed policy plus our custom policy.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KinesisScalingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:UpdateShardCount
+                Resource: "arn:aws:kinesis:*:*:stream/*"
+
+  ########################################
+  # 3) KinesisScalingLambda
+  ########################################
+  KinesisScalingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt KinesisScalingLambdaRole.Arn
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemory
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import time
+          import math
+          import logging
+          import boto3
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          kinesis_client = boto3.client('kinesis')
+
+          def lambda_handler(event, context):
+              logger.info("KinesisScalingLambda invoked. Processing SNS events.")
+              for record in event['Records']:
+                  sns_message = record['Sns']['Message']
+                  logger.info(f"Received SNS message: {sns_message}")
+                  process_alarm_message(sns_message)
+
+          def process_alarm_message(sns_message):
+              """
+              Parse the alarm message, derive which stream and shard target,
+              then do the scaling. (Uses both stream_name for logging
+              and stream_arn for Kinesis API calls.)
+              """
+              alarm_name, stream_name = parse_alarm_and_stream_name(sns_message)
+              if not stream_name:
+                  logger.info("No valid stream name extracted from alarm. Skipping.")
+                  return
+
+              desired_shards = get_desired_shards(alarm_name)
+              if desired_shards is None:
+                  logger.info("Could not deduce shard target from alarm name. Skipping.")
+                  return
+
+              try:
+                  # Retrieve both current shard count and the stream ARN.
+                  current_shards, stream_arn = get_current_shard_count(stream_name)
+                  if current_shards != desired_shards:
+                      logger.info(
+                          f"Scaling stream '{stream_name}' from {current_shards} to {desired_shards} shards."
+                      )
+                      scale_stream(stream_name, stream_arn, current_shards, desired_shards)
+                  else:
+                      logger.info(
+                          f"Stream '{stream_name}' is already at {desired_shards} shards. No scaling needed."
+                      )
+              except Exception as e:
+                  logger.error(f"Error scaling stream '{stream_name}': {e}", exc_info=True)
+
+          def parse_alarm_and_stream_name(sns_message):
+              # Attempt to parse the SNS message as JSON.
+              try:
+                  alarm_payload = json.loads(sns_message)
+                  alarm_name = alarm_payload.get('AlarmName', 'UnknownAlarm')
+              except:
+                  alarm_name = sns_message
+
+              # Our naming scheme: "<StreamName>-LatencyRangeX-..."
+              tokens = alarm_name.split('-')
+              if len(tokens) < 2:
+                  return alarm_name, None
+
+              stream_name = tokens[0]
+              return alarm_name, stream_name
+
+          def get_desired_shards(alarm_name):
+              """
+              Match the alarm's "RangeX" pattern to a desired shard count.
+              """
+              if "Range1" in alarm_name:
+                  return 1
+              elif "Range2" in alarm_name:
+                  return 2
+              elif "Range4" in alarm_name:
+                  return 4
+              elif "Range6" in alarm_name:
+                  return 6
+              elif "Range8" in alarm_name:
+                  return 8
+              return None
+
+          def get_current_shard_count(stream_name):
+              """
+              Describe the stream by name to get:
+                - The current shard count
+                - The Stream ARN
+              """
+              resp = kinesis_client.describe_stream_summary(StreamName=stream_name)
+              shard_count = resp['StreamDescriptionSummary']['OpenShardCount']
+              stream_arn = resp['StreamDescriptionSummary']['StreamARN']
+              return shard_count, stream_arn
+
+          def scale_stream(stream_name, stream_arn, current_shards, desired_shards):
+              """
+              Uses the stream ARN for subsequent API calls.
+              """
+              logger.info(f"Begin scaling from {current_shards} to {desired_shards}")
+              while current_shards != desired_shards:
+                  wait_for_stream_active(stream_arn)
+
+                  if desired_shards > current_shards:
+                      # Scale up: maximum 2x per iteration.
+                      max_up = current_shards * 2
+                      next_step = min(max_up, desired_shards)
+                      logger.info(f"Scaling up from {current_shards} to {next_step}")
+                  else:
+                      # Scale down: maximum 50% reduction per iteration.
+                      min_down = math.ceil(current_shards / 2)
+                      next_step = max(min_down, desired_shards)
+                      logger.info(f"Scaling down from {current_shards} to {next_step}")
+
+                  if next_step == current_shards:
+                      logger.info("No further scaling possible within constraints.")
+                      break
+
+                  try:
+                      kinesis_client.update_shard_count(
+                          StreamARN=stream_arn,
+                          TargetShardCount=next_step,
+                          ScalingType='UNIFORM_SCALING'
+                      )
+                      current_shards = next_step
+                      if current_shards != desired_shards:
+                          time.sleep(5)  # Pause 5 seconds before next iteration.
+                  except ClientError as e:
+                      logger.error(f"update_shard_count failed: {e}", exc_info=True)
+                      raise
+
+              logger.info(f"Final shard count for '{stream_name}' is {current_shards}.")
+
+          def wait_for_stream_active(stream_arn):
+              """
+              Wait until the stream (identified by its ARN) is ACTIVE.
+              """
+              while True:
+                  resp = kinesis_client.describe_stream_summary(StreamARN=stream_arn)
+                  status = resp['StreamDescriptionSummary']['StreamStatus']
+                  if status == 'ACTIVE':
+                      return
+                  logger.info(f"Stream ARN '{stream_arn}' in status {status}; waiting 5s...")
+                  time.sleep(5)
+
+  ########################################
+  # 4) Lambda Permission (SNS -> Lambda)
+  ########################################
+  KinesisScalingLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt KinesisScalingLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AutoScalingSNSTopic
+
+  ########################################
+  # 5) Subscribe the KinesisScalingLambda to SNS
+  ########################################
+  KinesisScalingTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt KinesisScalingLambda.Arn
+      Protocol: lambda
+      TopicArn: !Ref AutoScalingSNSTopic
+
+Outputs:
+  AutoScalingSNSTopicArn:
+    Description: "SNS topic for scaling alarms"
+    Value: !Ref AutoScalingSNSTopic
+
+  KinesisScalingLambdaName:
+    Description: "Lambda function that scales Kinesis shards"
+    Value: !GetAtt KinesisScalingLambda.Arn
